@@ -10,6 +10,10 @@
 4. runs single-GPU experiments in parallel (one per GPU), then the DDP ones on
    all GPUs; finished runs are skipped when the script is restarted
 5. writes summary.md / summary.csv / curves.png in --output_dir
+
+Metrics are kept to what the paper reports: test top-1 (best + final epoch,
+evaluated every --eval_freq epochs), runtime, and the mean train loss per epoch
+(accumulated on the GPU, one sync per epoch) to spot diverging runs.
 """
 import argparse
 import csv
@@ -74,7 +78,7 @@ class Runner:
         common = ['finetune.py', '--datapath', self.a.datapath, '--output_dir', self.a.output_dir,
                   '--exp_name', name, '--amp', '--epochs', str(epochs),
                   '--warmup', str(max(1, round(epochs * 0.1))),
-                  '--eval_freq', str(max(1, epochs // 20)), '--seed', str(self.a.seed)]
+                  '--eval_freq', str(self.a.eval_freq), '--seed', str(self.a.seed)]
         if compile_:
             common.append('--compile')
         if bench_steps:
@@ -338,6 +342,8 @@ def main():
     p.add_argument('--experiments', default='all', help='comma separated names, or "all"')
     p.add_argument('--compile', default='auto', choices=['auto', 'on', 'off'])
     p.add_argument('--bench_steps', type=int, default=100)
+    p.add_argument('--eval_freq', type=int, default=5,
+                   help='test-set top-1 every N epochs (+ always the last epoch); larger = less eval time')
     p.add_argument('--report_every', type=int, default=600, help='seconds between progress reports')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--list', action='store_true', help='list experiments and exit')

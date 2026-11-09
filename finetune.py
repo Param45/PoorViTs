@@ -142,7 +142,7 @@ def init_parser():
                         help='where runs are stored')
 
     parser.add_argument('--eval_freq', type=int, default=5,
-                        help='validate every N epochs (and always after the last one)')
+                        help='test-set top-1 every N epochs (and always after the last one)')
 
     parser.add_argument('--benchmark_steps', type=int, default=0,
                         help='if > 0: only measure training throughput over this many steps and exit')
@@ -473,16 +473,16 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         t_epoch = time.time()
         set_loader_epoch(train_loader, epoch)
-        lr, t_loss, t_acc = train(train_loader, model, criterion, optimizer,
-                                  epoch, scheduler, loss_scaler, args)
+        lr, t_loss = train(train_loader, model, criterion, optimizer,
+                           epoch, scheduler, loss_scaler, args)
         if is_main():
-            print(f'[Epoch {epoch+1}/{args.epochs}] train loss {t_loss:.4f}  train acc {t_acc:6.2f}  '
+            print(f'[Epoch {epoch+1}/{args.epochs}] train loss {t_loss:.4f}  '
                   f'lr {lr:.2e}  epoch {time.time()-t_epoch:.1f}s  elapsed {time.time()-t_start:.0f}s', flush=True)
         last = epoch == args.epochs - 1
         if (epoch % args.eval_freq == 0 or last) and is_main():
-            acc1 = validate(val_loader, model_without_ddp, criterion, lr, args, epoch=epoch)
+            acc1 = validate(val_loader, model_without_ddp, lr, args, epoch=epoch)
             logger_dict.print()
-            history.append({'epoch': epoch + 1, 'val_acc': acc1, 'train_loss': t_loss, 'train_acc': t_acc,
+            history.append({'epoch': epoch + 1, 'val_acc': acc1, 'train_loss': t_loss,
                             'time': time.time() - t_start})
 
             if acc1 > best_acc1:
@@ -546,30 +546,24 @@ def train_step(images, target, model, criterion, optimizer, scheduler, loss_scal
     loss_scaler.step(optimizer)
     loss_scaler.update()
     scheduler.step()  # change learning rate (per iteration)
-    return loss.detach(), output.detach(), target
+    return loss.detach().float()
 
 
 def train(train_loader, model, criterion, optimizer, epoch, scheduler, loss_scaler, args):
     model.train()
+    # only the mean training loss is tracked: accumulated on the GPU, read back once per epoch
     loss_sum = torch.zeros((), device=args.device)
-    correct = torch.zeros((), device=args.device)
-    n = 0
-    for i, (images, target) in enumerate(train_loader):
-        loss, output, target = train_step(images, target, model, criterion, optimizer, scheduler,
-                                          loss_scaler, args)
-        n += target.size(0)
-        loss_sum += loss.float() * target.size(0)
-        correct += (output.argmax(1) == target).sum()
-        if args.wandb and wandb.run:
-            wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"]})
+    n_steps = 0
+    for images, target in train_loader:
+        loss_sum += train_step(images, target, model, criterion, optimizer, scheduler, loss_scaler, args)
+        n_steps += 1
 
     lr = optimizer.param_groups[0]["lr"]
-    avg_loss, avg_acc1 = loss_sum.item() / n, correct.item() * 100.0 / n
+    avg_loss = loss_sum.item() / n_steps
     logger_dict.update(keys[0], avg_loss)
-    logger_dict.update(keys[1], avg_acc1)
     if args.wandb and wandb.run:
-        wandb.log({"train/loss": avg_loss, "train/acc": avg_acc1, 'epoch': epoch})
-    return lr, avg_loss, avg_acc1
+        wandb.log({"train/loss": avg_loss, "lr": lr, 'epoch': epoch})
+    return lr, avg_loss
 
 
 def benchmark(train_loader, model, criterion, optimizer, scheduler, loss_scaler, args, n_parameters,
@@ -627,30 +621,26 @@ def train_profile(train_loader, model, criterion, optimizer, epoch, scheduler, l
                 break
 
 
-def validate(val_loader, model, criterion, lr, args, epoch=None):
+def validate(val_loader, model, lr, args, epoch=None):
+    """Top-1 accuracy on the CIFAR test set (the only evaluation metric reported in the paper)."""
     model.eval()
-    loss_sum = torch.zeros((), device=args.device)
-    correct = torch.zeros((), device=args.device)
+    correct = torch.zeros((), device=args.device, dtype=torch.long)
     n = 0
-    with torch.no_grad(), autocast(args.amp):
-        for i, (images, target) in enumerate(val_loader):
+    with torch.inference_mode(), autocast(args.amp):
+        for images, target in val_loader:
             images = images.to(args.device, non_blocking=True)
             target = target.to(args.device, non_blocking=True)
-            output = model(images)
-            loss = criterion(output.float(), target)
-            n += images.size(0)
-            loss_sum += loss.float() * images.size(0)
-            correct += (output.argmax(1) == target).sum()
-    avg_loss, avg_acc1 = loss_sum.item() / n, correct.item() * 100.0 / n
+            correct += (model(images).argmax(1) == target).sum()
+            n += target.size(0)
+    avg_acc1 = correct.item() * 100.0 / n
     print(Fore.BLUE)
-    print(f'[Epoch {epoch+1}][V]   Loss: {avg_loss:.4e}   Top-1: {avg_acc1:6.2f}   LR: {lr:.6f}')
+    print(f'[Epoch {epoch+1}][V]   Top-1: {avg_acc1:6.2f}   LR: {lr:.6f}')
     print('*'*80)
 
-    logger_dict.update(keys[2], avg_loss)
-    logger_dict.update(keys[3], avg_acc1)
+    logger_dict.update(keys[1], avg_acc1)
 
     if args.wandb and wandb.run:
-        wandb.log({"val/loss": avg_loss, "val/acc": avg_acc1, 'epoch': epoch})
+        wandb.log({"val/acc": avg_acc1, 'epoch': epoch})
 
     return avg_acc1
 
@@ -741,8 +731,8 @@ if __name__ == '__main__':
     else:
         logger.setLevel(level=log.WARNING)
 
-    keys = ['T Loss', 'T Top-1', 'V Loss', 'V Top-1']
-    logger_dict = Logger_dict(logger, save_path) if is_main() else _NullLoggerDict()
+    keys = ['T Loss', 'V Top-1']
+    logger_dict = Logger_dict(logger, save_path, keys) if is_main() else _NullLoggerDict()
 
     main(args)
 

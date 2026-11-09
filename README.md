@@ -11,7 +11,7 @@ Our work real the redundancy among ViTs and prove that low-rank attention and lo
 
 1. Upload `notebooks/poorvits_kaggle.ipynb` to Kaggle, set *Accelerator: GPU T4 x2* and *Internet: On*.
 2. *Save Version -> Save & Run All*. The notebook clones this repo, downloads CIFAR-10 from the Hugging Face CDN,
-   trains all 16 experiments of Tables 2 & 3 and tests them on the CIFAR-10 test set.
+   trains all 16 experiments of Tables 2 & 3 and reports their CIFAR-10 test accuracy.
 
 Locally / any machine:
 
@@ -20,7 +20,7 @@ pip install -r requirements.txt
 python run_experiments.py --list                      # experiments + paper accuracy
 python run_experiments.py --budget_hours 3.6          # epochs are sized to fit the budget
 python run_experiments.py --epochs 100 --experiments baseline   # exact paper schedule for one run
-python evaluate.py --output_dir save_finetuned        # test all checkpoints
+python evaluate.py --output_dir save_finetuned        # optional: re-test saved checkpoints
 ```
 
 What changed compared to the original code (so that it runs fast and correctly on 2x T4):
@@ -32,7 +32,10 @@ What changed compared to the original code (so that it runs fast and correctly o
 * fixes: wandb is optional (`--wandb`), crash at the end of single-GPU runs (`args.rank`, `acc1`), mixup ran without
   autocast, DDP uses NCCL instead of gloo, whitening init is applied before DDP wrapping, the last epoch is always
   validated, sin-cos position embedding with several CLS tokens, ViT depth = 9 as in the paper, lr = 0.002 as in the paper.
-* `run_experiments.py` (scheduler + summary table/plots) and `evaluate.py` (test-set evaluation).
+* `run_experiments.py` (scheduler + summary table/plots) and `evaluate.py` (optional re-test of checkpoints).
+* only the metrics the paper reports are computed: test top-1 every `--eval_freq` (5) epochs + the last epoch,
+  runtime, and the mean train loss (GPU-side, one sync per epoch). Train accuracy, validation loss, the
+  separate re-evaluation pass and per-step host syncs were removed.
 
 Assumptions where the paper is not explicit: MLA latent dim d_c = 64; "bsN" in the DDP rows is the global batch size;
 Lion uses lr 2e-4 / weight decay 0.5 (AdamW lr/10, wd x10). With fewer than 100 epochs absolute accuracies are
