@@ -1,6 +1,13 @@
-torch==1.10.0+cu102
-torchvision==0.11.1+cu102
-timm==0.4.12
-pillow==8.4.0
-numpy==1.19.5
-einops==0.3.2
+# torch / torchvision / numpy / pillow / pyarrow / matplotlib are preinstalled on Kaggle
+torch>=2.1
+torchvision>=0.16
+numpy
+pillow
+pyarrow
+matplotlib
+einops
+gin-config
+colorama
+lion-pytorch
+# only for --arch swin / cait
+timm

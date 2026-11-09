@@ -29,7 +29,6 @@ from einops.layers.torch import Rearrange
 import torch.nn.functional as F
 
 fused_attn = hasattr(F, 'scaled_dot_product_attention')
-print(f'Using fused_attn: {fused_attn}')
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     if drop_prob == 0. or not training:
@@ -284,7 +283,7 @@ class PatchEmbed(nn.Module):
 class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, 
-                embed_dim=192, depth=12, num_heads=12, mlp_ratio=2., 
+                embed_dim=192, depth=9, num_heads=12, mlp_ratio=2.,  # paper: 9 blocks, 12 heads, dim 192 
                  qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  num_cls_token = 1, depth_token_only=0,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, sin_pos=False, **kwargs):
@@ -360,10 +359,10 @@ class VisionTransformer(nn.Module):
 
 
     def build_2d_sincos_position_embedding(self, temperature=10000.):
-        h, w = 8,8
+        h = w = int(math.sqrt(self.num_patches))
         grid_w = torch.arange(w, dtype=torch.float32)
         grid_h = torch.arange(h, dtype=torch.float32)
-        grid_w, grid_h = torch.meshgrid(grid_w, grid_h)
+        grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing='ij')
         assert self.embed_dim % 4 == 0, 'Embed dimension must be divisible by 4 for 2D sin-cos position embedding'
         pos_dim = self.embed_dim // 4
         omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
@@ -372,7 +371,7 @@ class VisionTransformer(nn.Module):
         out_h = torch.einsum('m,d->md', [grid_h.flatten(), omega])
         pos_emb = torch.cat([torch.sin(out_w), torch.cos(out_w), torch.sin(out_h), torch.cos(out_h)], dim=1)[None, :, :]
 
-        pe_token = torch.zeros([1, 1, self.embed_dim], dtype=torch.float32)
+        pe_token = torch.zeros([1, self.num_cls_token, self.embed_dim], dtype=torch.float32)
         self.pos_embed = nn.Parameter(torch.cat([pe_token, pos_emb], dim=1))
         self.pos_embed.requires_grad = False
 

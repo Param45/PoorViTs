@@ -1,0 +1,7 @@
+data/
+save_finetuned/
+results/
+wandb/
+__pycache__/
+*.pyc
+*.pth

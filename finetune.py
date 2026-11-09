@@ -1,31 +1,43 @@
 """
-CUDA_VISIBLE_DEVICES=1 WANDB_NAME=amp torchrun --nproc_per_node=1 --master_port 29501  finetune.py --datapath ~/gent/data --batch_size=256 --amp
+Train a Tiny ViT on CIFAR-10 (Powerful Design of Small Vision Transformer on CIFAR10).
+
+single GPU:
+    python finetune.py --datapath ./data --amp --exp_name baseline
+two GPUs (DDP, --batch_size is per GPU):
+    torchrun --nproc_per_node=2 finetune.py --datapath ./data --amp --batch_size 128 --exp_name ddp_bs256
+ablations (see run_experiments.py for the full list):
+    --aa / --mu / --cm            disable AutoAugment / Mixup / CutMix
+    --sin_pos, --whitening        patch-token initialisation
+    --gin 'Attention.latent_mode="q"'           MLA low-rank compression
+    --gin ViT.embed_dim=96 ViT.num_cls_token=2  multi-CLS tokens
 """
-import wandb
-from utils.mix import cutmix_data, mixup_data, mixup_criterion
-import numpy as np
-import random
+import argparse
+import json
 import logging as log
+import math
+import os
+import random
+import time
+import warnings
+
+import gin
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
 from colorama import Fore, Style
-import torch.distributed as dist
-from utils.losses import LabelSmoothingCrossEntropy
-import os
-from utils.sampler import RASampler
-from utils.logger_dict import Logger_dict
-from utils.print_progress import progress_bar
-from utils.training_functions import accuracy
-import argparse
-from utils.scheduler import build_scheduler
-from utils.dataloader import datainfo, dataload
+
 from models.build_model import create_model
-from tqdm import tqdm
-import warnings
-import gin
+from utils.dataloader import datainfo, dataload
+from utils.logger_dict import Logger_dict
+from utils.losses import LabelSmoothingCrossEntropy
+from utils.mix import cutmix_data, mixup_data, mixup_criterion
+from utils.sampler import RASampler
+from utils.scheduler import build_scheduler
+
 warnings.filterwarnings("ignore", category=Warning)
 
 best_acc1 = 0
@@ -51,10 +63,7 @@ def init_whitening_conv(layer, train_set, eps=5e-4):
     eigenvalues, eigenvectors = get_whitening_parameters(patches)
     eigenvectors_scaled = eigenvectors / torch.sqrt(eigenvalues + eps)
     n_patterns = eigenvectors_scaled.shape[0]
-    n_channels = layer.weight.data.shape[0]
-    # rescale = torch.randn(n_channels//n_patterns).reshape(-1,1).repeat(1,n_patterns).reshape(-1,1,1,1)/2
-    # layer.weight.data[:] = rescale * eigenvectors_scaled.repeat(n_channels//n_patterns,1,1,1)
-    layer.weight.data[:n_patterns] = eigenvectors_scaled
+    layer.weight.data[:n_patterns] = eigenvectors_scaled.to(layer.weight.dtype)
 
 def init_parser():
     parser = argparse.ArgumentParser(
@@ -71,8 +80,12 @@ def init_parser():
     parser.add_argument('--dataset', default='CIFAR10', choices=[
                         'CIFAR10', 'CIFAR100', 'Tiny-Imagenet', 'SVHN', 'CINIC'], type=str, help='small dataset path')
 
-    parser.add_argument('-j', '--workers', default=10, type=int,
-                        metavar='N', help='number of data loading workers (default: 10)')
+    parser.add_argument('--data_pipeline', default='gpu', choices=['gpu', 'cpu'],
+                        help='gpu: augment on the GPU (CIFAR only, fast on few-CPU machines such as Kaggle); '
+                             'cpu: original torchvision/PIL DataLoader pipeline')
+
+    parser.add_argument('-j', '--workers', default=min(10, os.cpu_count() or 1), type=int,
+                        metavar='N', help='number of data loading workers (cpu pipeline)')
 
     parser.add_argument('--print-freq', default=1, type=int,
                         metavar='N', help='log frequency (by iteration)')
@@ -85,14 +98,14 @@ def init_parser():
                         metavar='N', help='number of warmup epochs')
 
     parser.add_argument('-b', '--batch_size', default=256, type=int,
-                        metavar='N', help='mini-batch size (default: 128)', dest='batch_size')
+                        metavar='N', help='mini-batch size per GPU (default: 256)', dest='batch_size')
 
     parser.add_argument('--opt', default='adamw', type=str, help='optimizer')
-    parser.add_argument('--lr', default=0.001, type=float,
-                        help='initial learning rate')
+    parser.add_argument('--lr', default=0.002, type=float,
+                        help='initial learning rate (paper: 0.002)')
 
     parser.add_argument('--weight-decay', default=5e-2,
-                        type=float, help='weight decay (default: 1e-4)')
+                        type=float, help='weight decay (default: 5e-2)')
 
     parser.add_argument('--arch', type=str, default='vit', choices=MODELS)
 
@@ -107,6 +120,9 @@ def init_parser():
     parser.add_argument('--amp', action='store_true',
                         help='enable mixed precision')
 
+    parser.add_argument('--compile', action='store_true',
+                        help='torch.compile the model (faster training)')
+
     parser.add_argument('--no_cuda', action='store_true', help='disable cuda')
 
     parser.add_argument('--ls', action='store_false', help='label smoothing')
@@ -118,6 +134,23 @@ def init_parser():
     parser.add_argument('--depth', type=int, help='disable cuda')
 
     parser.add_argument('--tag', type=str, help='tag', default='')
+
+    parser.add_argument('--exp_name', type=str, default='',
+                        help='name of the output folder (default: derived from args)')
+
+    parser.add_argument('--output_dir', type=str, default=os.path.join(os.getcwd(), 'save_finetuned'),
+                        help='where runs are stored')
+
+    parser.add_argument('--eval_freq', type=int, default=5,
+                        help='validate every N epochs (and always after the last one)')
+
+    parser.add_argument('--benchmark_steps', type=int, default=0,
+                        help='if > 0: only measure training throughput over this many steps and exit')
+
+    parser.add_argument('--wandb', action='store_true', help='log to Weights & Biases')
+
+    parser.add_argument('--train_subset', type=int, default=0,
+                        help='debug: only use the first N train/test images (CIFAR)')
 
     parser.add_argument('--seed', type=int, default=0, help='seed')
 
@@ -178,22 +211,146 @@ def init_parser():
     return parser
 
 
+def is_main():
+    return (not args.distributed) or args.rank == 0
+
+
+def banner(msg, color=Fore.YELLOW):
+    print(color + '*'*80)
+    logger.debug(msg)
+    print('*'*80 + Style.RESET_ALL)
+
+
+def autocast(enabled):
+    if args.device.type == 'cuda':
+        return torch.autocast(device_type='cuda', dtype=torch.float16, enabled=enabled)
+    return torch.autocast(device_type='cpu', dtype=torch.bfloat16, enabled=enabled)
+
+
+def make_grad_scaler(enabled):
+    enabled = enabled and args.device.type == 'cuda'
+    try:
+        return torch.amp.GradScaler('cuda', enabled=enabled)
+    except (AttributeError, TypeError):  # torch < 2.3
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def synchronize():
+    if args.device.type == 'cuda':
+        torch.cuda.synchronize()
+
+
+class BatchAugmentation:
+    # https://openaccess.thecvf.com/content_CVPR_2020/papers/Hoffer_Augment_Your_Batch_Improving_Generalization_Through_Instance_Repetition_CVPR_2020_paper.pdf
+    def __init__(self, sampler, repeat=1):
+        self.sampler = sampler
+        self.repeat = repeat
+
+    def __len__(self):
+        return len(self.sampler)*self.repeat
+
+    def __iter__(self):
+        for index in self.sampler:
+            for _ in range(self.repeat):
+                yield index
+
+    def set_epoch(self, epoch):
+        self.sampler.set_epoch(epoch)
+
+
+def build_loaders(args, data_info):
+    """Returns (train_loader, val_loader). Train batches may live on CPU or GPU."""
+    mean, std = data_info['stat']
+    cifar = args.dataset in ('CIFAR10', 'CIFAR100')
+    if cifar:
+        from utils.cifar_data import load_cifar
+        x_train, y_train, x_test, y_test = load_cifar(args.datapath, args.dataset)
+        if args.train_subset:
+            x_train, y_train = x_train[:args.train_subset], y_train[:args.train_subset]
+            x_test, y_test = x_test[:args.train_subset], y_test[:args.train_subset]
+
+    if args.data_pipeline == 'gpu':
+        assert cifar, '--data_pipeline gpu supports CIFAR10/CIFAR100 only, use --data_pipeline cpu'
+        from utils.gpu_aug import GPULoader
+        device = args.device
+        banner(f'GPU data pipeline (AutoAugment={args.aa}, RandomErasing={args.re}, RA={args.ra})')
+        train_loader = GPULoader(x_train, y_train, args.batch_size, mean, std, device, train=True,
+                                 aa=args.aa, re=args.re, re_sh=args.re_sh, re_r1=args.re_r1, ra=args.ra,
+                                 distributed=args.distributed, rank=args.rank, world_size=args.world_size,
+                                 seed=args.seed)
+        val_loader = GPULoader(x_test, y_test, 1000, mean, std, device, train=False)
+        return train_loader, val_loader
+
+    '''
+        Data Augmentation (original CPU pipeline)
+    '''
+    normalize = [transforms.Normalize(mean=mean, std=std)]
+    augmentations = [
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(data_info['img_size'], padding=4)
+    ]
+    if args.aa:
+        if 'CIFAR' in args.dataset:
+            from utils.autoaug import CIFAR10Policy
+            augmentations += [CIFAR10Policy()]
+        elif 'SVHN' in args.dataset:
+            from utils.autoaug import SVHNPolicy
+            augmentations += [SVHNPolicy()]
+        else:
+            from utils.autoaug import ImageNetPolicy
+            augmentations += [ImageNetPolicy()]
+        banner('Autoaugmentation used')
+    augmentations += [transforms.ToTensor(), *normalize]
+    if args.re > 0:
+        from utils.random_erasing import RandomErasing
+        augmentations += [RandomErasing(probability=args.re, sh=args.re_sh, r1=args.re_r1, mean=mean)]
+        banner(f'Random erasing({args.re}) used ')
+    augmentations = transforms.Compose(augmentations)
+
+    if cifar:
+        from utils.cifar_data import ArrayDataset
+        train_dataset = ArrayDataset(x_train, y_train, augmentations)
+        val_dataset = ArrayDataset(x_test, y_test, transforms.Compose([transforms.ToTensor(), *normalize]))
+    else:
+        train_dataset, val_dataset = dataload(args, augmentations, normalize, data_info)
+
+    persistent = args.workers > 0
+    if args.distributed:
+        sampler_train = torch.utils.data.DistributedSampler(
+            train_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, sampler=BatchAugmentation(sampler_train, args.ra),
+            num_workers=args.workers, batch_size=args.batch_size, drop_last=True, pin_memory=True,
+            persistent_workers=persistent)
+    else:
+        sampler_train = RASampler(
+            len(train_dataset), args.batch_size, 1, args.ra, shuffle=True, drop_last=True)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, num_workers=args.workers, pin_memory=True, batch_sampler=sampler_train,
+            persistent_workers=persistent)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=1000, shuffle=False, pin_memory=True, num_workers=args.workers)
+    return train_loader, val_loader
+
+
+def set_loader_epoch(loader, epoch):
+    if hasattr(loader, 'set_epoch'):
+        loader.set_epoch(epoch)
+    elif isinstance(getattr(loader, 'sampler', None), BatchAugmentation):
+        loader.sampler.set_epoch(epoch)
+
+
 def main(args):
     global best_acc1
 
-    torch.cuda.set_device(args.gpu)
+    if args.device.type == 'cuda':
+        torch.cuda.set_device(args.gpu)
 
     data_info = datainfo(logger, args)
 
     model = create_model(data_info['img_size'], data_info['n_classes'], args)
-
-
-    model.cuda(args.gpu)
-
+    model.to(args.device)
     model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu])
 
     print(Fore.GREEN+'*'*80)
     logger.debug(f"Creating model: {model_name}")
@@ -222,142 +379,45 @@ def main(args):
         state_dict = {k: v if v.size() == model_dict[k].size(
         ) else model_dict[k] for k, v in zip(model_dict.keys(), state_dict.values())}
         model.load_state_dict(state_dict, strict=False)
-        # print('Pretrained weights found at {} and loaded with msg: {}'.format(args.pretrained_weights, msg))
-    if args.ls:
-        print(Fore.YELLOW + '*'*80)
-        logger.debug('label smoothing used')
-        print('*'*80+Style.RESET_ALL)
-        criterion = LabelSmoothingCrossEntropy()
 
+    if args.ls:
+        banner('label smoothing used')
+        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(args.device)
 
     if args.sd > 0.:
-        print(Fore.YELLOW + '*'*80)
-        logger.debug(f'Stochastic depth({args.sd}) used ')
-        print('*'*80+Style.RESET_ALL)
-
-    criterion = criterion.cuda(args.gpu)
-
-    normalize = [transforms.Normalize(
-        mean=data_info['stat'][0], std=data_info['stat'][1])]
-
+        banner(f'Stochastic depth({args.sd}) used ')
     if args.cm:
-        print(Fore.YELLOW+'*'*80)
-        logger.debug('Cutmix used')
-        print('*'*80 + Style.RESET_ALL)
+        banner('Cutmix used')
     if args.mu:
-        print(Fore.YELLOW+'*'*80)
-        logger.debug('Mixup used')
-        print('*'*80 + Style.RESET_ALL)
+        banner('Mixup used')
     if args.ra > 1:
+        banner(f'Repeated Aug({args.ra}) used')
 
-        print(Fore.YELLOW+'*'*80)
-        logger.debug(f'Repeated Aug({args.ra}) used')
-        print('*'*80 + Style.RESET_ALL)
+    train_loader, val_loader = build_loaders(args, data_info)
 
-    '''
-        Data Augmentation
-    '''
-    augmentations = []
-
-    augmentations += [
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(data_info['img_size'], padding=4)
-    ]
-
-    if args.aa == True:
-        print(Fore.YELLOW+'*'*80)
-        logger.debug('Autoaugmentation used')
-
-        if 'CIFAR' in args.dataset:
-            print("CIFAR Policy")
-            from utils.autoaug import CIFAR10Policy
-            augmentations += [
-                CIFAR10Policy()
-            ]
-
-        elif 'SVHN' in args.dataset:
-            print("SVHN Policy")
-            from utils.autoaug import SVHNPolicy
-            augmentations += [
-                SVHNPolicy()
-            ]
-
-        else:
-            from utils.autoaug import ImageNetPolicy
-            augmentations += [
-                ImageNetPolicy()
-            ]
-
-        print('*'*80 + Style.RESET_ALL)
-
-    augmentations += [
-        transforms.ToTensor(),
-        *normalize]
-
-    if args.re > 0:
-        from utils.random_erasing import RandomErasing
-        print(Fore.YELLOW + '*'*80)
-        logger.debug(f'Random erasing({args.re}) used ')
-        print('*'*80+Style.RESET_ALL)
-
-        augmentations += [
-            RandomErasing(probability=args.re, sh=args.re_sh,
-                          r1=args.re_r1, mean=data_info['stat'][0])
-        ]
-
-    augmentations = transforms.Compose(augmentations)
-
-    train_dataset, val_dataset = dataload(
-        args, augmentations, normalize, data_info)
-
-    class BatchAugmentation:
-        # https://openaccess.thecvf.com/content_CVPR_2020/papers/Hoffer_Augment_Your_Batch_Improving_Generalization_Through_Instance_Repetition_CVPR_2020_paper.pdf
-        def __init__(self, sampler, repeat=1):
-            self.sampler = sampler
-            self.repeat = repeat
-
-        def __len__(self):
-            return len(self.sampler)*self.repeat
-
-        def __iter__(self):
-            for index in self.sampler:
-                for _ in range(self.repeat):
-                    yield index
-
-        def set_epoch(self, epoch):
-            self.sampler.set_epoch(epoch)
-
-    if args.distributed:
-        sampler_train = torch.utils.data.DistributedSampler(
-            train_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True
-        )
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            sampler=BatchAugmentation(sampler_train, args.ra),  # mark 13
-            num_workers=args.workers,
-            batch_size=args.batch_size,
-            drop_last=True, pin_memory=False)
-    else:
-        sampler_train = RASampler(
-            len(train_dataset), args.batch_size, 1, args.ra, shuffle=True, drop_last=True)
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,  num_workers=args.workers, pin_memory=True,
-            batch_sampler=sampler_train)  # mark 12
-    
     if args.whitening:
+        # done before DDP wrapping so that every rank starts from the same weights (DDP broadcasts rank 0)
+        banner('Whitening initialisation of the patch embedding')
         with torch.no_grad():
             train_images = []
-            for x,y in train_loader:
-                train_images.append(x)
+            for x, y in train_loader:
+                train_images.append(x.to(args.device))
                 if len(train_images)*len(x) > 5000:
                     break
             train_images = torch.cat(train_images)
-            init_whitening_conv(model.patch_embed.proj, train_images)
+            init_whitening_conv(model_without_ddp.patch_embed.proj, train_images)
+            del train_images
 
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu] if args.device.type == 'cuda' else None)
+    if args.compile:
+        banner('torch.compile enabled')
+        model = torch.compile(model)
+
     '''
         Training
     '''
@@ -365,11 +425,9 @@ def main(args):
     if args.opt == 'muon':
         from utils.muon import Muon
         # code: https://github.com/KellerJordan/Muon
-        # Muon is intended to optimize only the internal ≥2D parameters of a network. Embeddings, classifier heads, and scalar or vector parameters should be optimized using AdamW instead.
-        # Find ≥2D parameters in the body of the network -- these will be optimized by Muon
         muon_params = []
         adamw_params = []
-        for name, p in model.named_parameters():
+        for name, p in model_without_ddp.named_parameters():
             if 'head' in name or 'fc' in name or 'embed' in name:
                 adamw_params.append(p)
             elif p.ndim >= 2:
@@ -377,61 +435,62 @@ def main(args):
             else:
                 adamw_params.append(p)
         print(f"Muon parameters: {len(muon_params)}")
-        # Create the optimizer
         optimizer = Muon(muon_params, lr=0.02, momentum=0.9,
                          adamw_params=adamw_params, adamw_lr=1e-3, adamw_wd=args.weight_decay)
     elif args.opt == 'lion':
         from lion_pytorch import Lion
-        optimizer = Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
+        optimizer = Lion(model_without_ddp.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     else:
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            model_without_ddp.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(args, optimizer, len(train_loader))
 
-    # summary(model, (3, data_info['img_size'], data_info['img_size']))
+    loss_scaler = make_grad_scaler(args.amp)
+
+    start_epoch = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        model_without_ddp.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        start_epoch = checkpoint['epoch'] + 1
+
+    if args.profile:
+        train_profile(train_loader, model, criterion, optimizer, args.epochs, scheduler, loss_scaler, args)
+        return
+
+    if args.benchmark_steps > 0:
+        benchmark(train_loader, model, criterion, optimizer, scheduler, loss_scaler, args, n_parameters)
+        return
 
     print()
     print("Beginning training")
     print()
 
-    lr = optimizer.param_groups[0]["lr"]
-    if args.amp:
-        loss_scaler = torch.cuda.amp.GradScaler()
-    else:
-        loss_scaler = None
-
-    if args.resume:
-        checkpoint = torch.load(args.resume)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-        final_epoch = args.epochs
-        args.epochs = final_epoch - (checkpoint['epoch'] + 1)
-    if not args.distributed or args.rank == 0:
-        pbar = tqdm(range(args.epochs))
-    else:
-        pbar = range(args.epochs)
-    
-    if args.profile:
-        train_profile(train_loader, model, criterion, optimizer, args.epochs, scheduler, loss_scaler, args)
-        return
-    for epoch in pbar:
-        if args.distributed:
-            train_loader.sampler.set_epoch(epoch)
-        lr = train(train_loader, model, criterion, optimizer,
-                   epoch, scheduler, loss_scaler, args)
-        if (epoch % 5 == 0) and (not args.distributed or args.rank == 0):
-            acc1 = validate(val_loader, model, criterion,
-                            lr, args, epoch=epoch)
+    t_start = time.time()
+    acc1 = 0.0
+    history = []
+    for epoch in range(start_epoch, args.epochs):
+        t_epoch = time.time()
+        set_loader_epoch(train_loader, epoch)
+        lr, t_loss, t_acc = train(train_loader, model, criterion, optimizer,
+                                  epoch, scheduler, loss_scaler, args)
+        if is_main():
+            print(f'[Epoch {epoch+1}/{args.epochs}] train loss {t_loss:.4f}  train acc {t_acc:6.2f}  '
+                  f'lr {lr:.2e}  epoch {time.time()-t_epoch:.1f}s  elapsed {time.time()-t_start:.0f}s', flush=True)
+        last = epoch == args.epochs - 1
+        if (epoch % args.eval_freq == 0 or last) and is_main():
+            acc1 = validate(val_loader, model_without_ddp, criterion, lr, args, epoch=epoch)
             logger_dict.print()
+            history.append({'epoch': epoch + 1, 'val_acc': acc1, 'train_loss': t_loss, 'train_acc': t_acc,
+                            'time': time.time() - t_start})
 
             if acc1 > best_acc1:
-                print('* Best model upate *')
+                print('* Best model update *')
                 best_acc1 = acc1
 
                 torch.save({
-                    'model_state_dict': model.state_dict(),
+                    'model_state_dict': model_without_ddp.state_dict(),
                     'epoch': epoch,
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
@@ -441,125 +500,111 @@ def main(args):
             print('*'*80)
             print(Style.RESET_ALL)
 
-    if args.rank == 0:
-
+    runtime = time.time() - t_start
+    if is_main():
         print(Fore.RED+'*'*80)
-        logger.debug(f'best top-1: {best_acc1:.2f}, final top-1: {acc1:.2f}')
+        logger.debug(f'best top-1: {best_acc1:.2f}, final top-1: {acc1:.2f}, runtime: {runtime:.0f}s')
         print('*'*80+Style.RESET_ALL)
-        torch.save(model.state_dict(), os.path.join(
-            save_path, 'checkpoint.pth'))
+        torch.save(model_without_ddp.state_dict(), os.path.join(save_path, 'checkpoint.pth'))
+        with open(os.path.join(save_path, 'results.json'), 'w') as f:
+            json.dump({'exp_name': args.exp_name or model_name, 'best_acc': best_acc1, 'final_acc': acc1,
+                       'runtime_sec': runtime, 'epochs': args.epochs, 'params': n_parameters,
+                       'world_size': args.world_size, 'global_batch_size': args.batch_size * args.world_size,
+                       'history': history, 'args': {k: v for k, v in vars(args).items()
+                                                    if isinstance(v, (int, float, str, bool, list))}},
+                      f, indent=2)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, scheduler,  loss_scaler, args):
-    model.train()
-    loss_val, acc1_val = 0, 0
-    n = 0
+def mix_batch(images, target, args):
+    """CutMix / Mixup exactly as in the original training loop.
+    Returns (images, y_a, y_b, lam) or (images, None, None, None) when not mixed."""
+    if not (args.cm or args.mu) or np.random.rand(1) >= args.mix_prob:
+        return images, None, None, None
+    use_cutmix = args.cm and (not args.mu or np.random.rand(1) < 0.5)
+    if use_cutmix:
+        slicing_idx, y_a, y_b, lam, sliced = cutmix_data(images, target, args)
+        images[:, :, slicing_idx[0]:slicing_idx[2], slicing_idx[1]:slicing_idx[3]] = sliced
+    else:
+        images, y_a, y_b, lam = mixup_data(images, target, args)
+    return images, y_a, y_b, lam
 
-    for i, (images, target) in enumerate(train_loader):
-        if (not args.no_cuda) and torch.cuda.is_available():
-            images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
 
-        # Cutmix only
-        if args.cm and not args.mu:
-            r = np.random.rand(1)
-
-            with torch.cuda.amp.autocast(enabled=args.amp):
-                if r < args.mix_prob:
-                    slicing_idx, y_a, y_b, lam, sliced = cutmix_data(
-                        images, target, args)
-                    images[:, :, slicing_idx[0]:slicing_idx[2],
-                           slicing_idx[1]:slicing_idx[3]] = sliced
-                    output = model(images)
-                    loss = mixup_criterion(criterion, output, y_a, y_b, lam)
-                else:
-                    output = model(images)
-
-                    loss = criterion(output, target)
-
-        # Mixup only
-        elif not args.cm and args.mu:
-            r = np.random.rand(1)
-            if r < args.mix_prob:
-                images, y_a, y_b, lam = mixup_data(images, target, args)
-                output = model(images)
-                loss = mixup_criterion(criterion, output, y_a, y_b, lam)
-
-            else:
-                output = model(images)
-
-                loss = criterion(output, target)
-
-        # Both Cutmix and Mixup
-        elif args.cm and args.mu:
-            r = np.random.rand(1)
-            if r < args.mix_prob:
-                switching_prob = np.random.rand(1)
-
-                # Cutmix
-                if switching_prob < 0.5:
-                    slicing_idx, y_a, y_b, lam, sliced = cutmix_data(
-                        images, target, args)
-                    images[:, :, slicing_idx[0]:slicing_idx[2],
-                           slicing_idx[1]:slicing_idx[3]] = sliced
-                    output = model(images)
-
-                    loss = mixup_criterion(criterion, output, y_a, y_b, lam)
-
-                # Mixup
-                else:
-                    images, y_a, y_b, lam = mixup_data(images, target, args)
-                    output = model(images)
-
-                    loss = mixup_criterion(criterion, output, y_a, y_b, lam)
-
-            else:
-                output = model(images)
-
-                loss = criterion(output, target)
-
-        # No Mix
+def train_step(images, target, model, criterion, optimizer, scheduler, loss_scaler, args):
+    if images.device != args.device:
+        images = images.to(args.device, non_blocking=True)
+        target = target.to(args.device, non_blocking=True)
+    images, y_a, y_b, lam = mix_batch(images, target, args)
+    with autocast(args.amp):
+        output = model(images)
+        if lam is not None:
+            loss = mixup_criterion(criterion, output, y_a, y_b, lam)
         else:
-            output = model(images)
-
             loss = criterion(output, target)
 
-        acc = accuracy(output, target, (1,))
-        acc1 = acc[0]
-        n += images.size(0)
-        loss_val += float(loss.item() * images.size(0))
-        acc1_val += float(acc1[0] * images.size(0))
+    optimizer.zero_grad(set_to_none=True)
+    loss_scaler.scale(loss).backward()
+    loss_scaler.step(optimizer)
+    loss_scaler.update()
+    scheduler.step()  # change learning rate (per iteration)
+    return loss.detach(), output.detach(), target
 
-        optimizer.zero_grad()
 
-        if loss_scaler is not None:
-            loss_scaler.scale(loss).backward()
-            loss_scaler.step(optimizer)
-            loss_scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
-        scheduler.step() # change learning rate
-        lr = optimizer.param_groups[0]["lr"]
-        if wandb.run:
-            wandb.log({"loss": loss.item(), "lr": lr})
-        if args.print_freq >= 0 and i % args.print_freq == 0:
-            avg_loss, avg_acc1 = (loss_val / n), (acc1_val / n)
-        #     progress_bar(i, len(train_loader),f'[Epoch {epoch+1}/{args.epochs}][T][{i}]   Loss: {avg_loss:.4e}   Top-1: {avg_acc1:6.2f}   LR: {lr:.7f}'+' '*10)
+def train(train_loader, model, criterion, optimizer, epoch, scheduler, loss_scaler, args):
+    model.train()
+    loss_sum = torch.zeros((), device=args.device)
+    correct = torch.zeros((), device=args.device)
+    n = 0
+    for i, (images, target) in enumerate(train_loader):
+        loss, output, target = train_step(images, target, model, criterion, optimizer, scheduler,
+                                          loss_scaler, args)
+        n += target.size(0)
+        loss_sum += loss.float() * target.size(0)
+        correct += (output.argmax(1) == target).sum()
+        if args.wandb and wandb.run:
+            wandb.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"]})
 
+    lr = optimizer.param_groups[0]["lr"]
+    avg_loss, avg_acc1 = loss_sum.item() / n, correct.item() * 100.0 / n
     logger_dict.update(keys[0], avg_loss)
     logger_dict.update(keys[1], avg_acc1)
-    if wandb.run:
-            wandb.log({"train/loss": avg_loss, "train/acc": avg_acc1, 'epoch': epoch})
-    return lr
+    if args.wandb and wandb.run:
+        wandb.log({"train/loss": avg_loss, "train/acc": avg_acc1, 'epoch': epoch})
+    return lr, avg_loss, avg_acc1
 
-import torch.profiler
+
+def benchmark(train_loader, model, criterion, optimizer, scheduler, loss_scaler, args, n_parameters,
+              warmup=25):
+    """Measure training throughput (images/s, summed over all GPUs) including the data pipeline."""
+    model.train()
+    done, t0 = 0, None
+    t_compile = time.time()
+    while True:
+        for images, target in train_loader:
+            if done == warmup:
+                synchronize()
+                t0 = time.time()
+                print(f'warmup (incl. compile) took {t0 - t_compile:.1f}s', flush=True)
+            train_step(images, target, model, criterion, optimizer, scheduler, loss_scaler, args)
+            done += 1
+            if done == warmup + args.benchmark_steps:
+                break
+        if done == warmup + args.benchmark_steps:
+            break
+    synchronize()
+    elapsed = time.time() - t0
+    img_s = args.benchmark_steps * args.batch_size * args.world_size / elapsed
+    if is_main():
+        res = {'img_per_sec': img_s, 'steps': args.benchmark_steps, 'global_batch_size':
+               args.batch_size * args.world_size, 'compile_warmup_sec': t0 - t_compile,
+               'params': n_parameters, 'peak_mem_gb': torch.cuda.max_memory_allocated() / 1e9 if args.device.type == 'cuda' else 0.0}
+        print('BENCHMARK ' + json.dumps(res), flush=True)
+        with open(os.path.join(save_path, 'benchmark.json'), 'w') as f:
+            json.dump(res, f)
+
 
 def train_profile(train_loader, model, criterion, optimizer, epoch, scheduler, loss_scaler, args):
+    import torch.profiler
     model.train()
-    loss_val, acc1_val = 0, 0
-    n = 0
-
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -569,97 +614,69 @@ def train_profile(train_loader, model, criterion, optimizer, epoch, scheduler, l
             warmup=1,
             active=3,
             repeat=2),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(save_path, 'profile')),
         record_shapes=True,
         profile_memory=True,
         with_stack=True
     ) as prof:
         for i, (images, target) in enumerate(train_loader):
-            with torch.profiler.record_function("load_batch"):
-                if (not args.no_cuda) and torch.cuda.is_available():
-                    images = images.cuda(args.gpu, non_blocking=True)
-                    target = target.cuda(args.gpu, non_blocking=True)
-
-            # Cutmix only
-            
-            with torch.profiler.record_function("forward"):
-                r = np.random.rand(1)
-                with torch.cuda.amp.autocast(enabled=args.amp):
-                    if r < args.mix_prob:
-                        slicing_idx, y_a, y_b, lam, sliced = cutmix_data(
-                            images, target, args)
-                        images[:, :, slicing_idx[0]:slicing_idx[2],
-                            slicing_idx[1]:slicing_idx[3]] = sliced
-                        output = model(images)
-                        loss = mixup_criterion(criterion, output, y_a, y_b, lam)
-                    else:
-                        output = model(images)
-                        loss = criterion(output, target)
-            with torch.profiler.record_function("backward"):
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-            # Update the profiler
+            with torch.profiler.record_function("train_step"):
+                train_step(images, target, model, criterion, optimizer, scheduler, loss_scaler, args)
             prof.step()
             if i > 10:
                 break
-        
+
 
 def validate(val_loader, model, criterion, lr, args, epoch=None):
     model.eval()
-    loss_val, acc1_val = 0, 0
+    loss_sum = torch.zeros((), device=args.device)
+    correct = torch.zeros((), device=args.device)
     n = 0
-    with torch.no_grad():
+    with torch.no_grad(), autocast(args.amp):
         for i, (images, target) in enumerate(val_loader):
-            if (not args.no_cuda) and torch.cuda.is_available():
-                images = images.cuda(args.gpu, non_blocking=True)
-                target = target.cuda(args.gpu, non_blocking=True)
-
+            images = images.to(args.device, non_blocking=True)
+            target = target.to(args.device, non_blocking=True)
             output = model(images)
-            loss = criterion(output, target)
-
-            acc = accuracy(output, target, (1, 5))
-            acc1 = acc[0]
+            loss = criterion(output.float(), target)
             n += images.size(0)
-            loss_val += float(loss.item() * images.size(0))
-            acc1_val += float(acc1[0] * images.size(0))
-
-            if args.print_freq >= 0 and i % args.print_freq == 0:
-                avg_loss, avg_acc1 = (loss_val / n), (acc1_val / n)
-                progress_bar(i, len(
-                    val_loader), f'[Epoch {epoch+1}][V][{i}]   Loss: {avg_loss:.4e}   Top-1: {avg_acc1:6.2f}   LR: {lr:.6f}')
-    print()
-
+            loss_sum += loss.float() * images.size(0)
+            correct += (output.argmax(1) == target).sum()
+    avg_loss, avg_acc1 = loss_sum.item() / n, correct.item() * 100.0 / n
     print(Fore.BLUE)
+    print(f'[Epoch {epoch+1}][V]   Loss: {avg_loss:.4e}   Top-1: {avg_acc1:6.2f}   LR: {lr:.6f}')
     print('*'*80)
 
     logger_dict.update(keys[2], avg_loss)
     logger_dict.update(keys[3], avg_acc1)
 
-    wandb.log({"val/loss": avg_loss, "val/acc": avg_acc1, 'epoch': epoch})
+    if args.wandb and wandb.run:
+        wandb.log({"val/loss": avg_loss, "val/acc": avg_acc1, 'epoch': epoch})
 
     return avg_acc1
+
+
+class _NullLoggerDict:
+    def update(self, *a, **k):
+        pass
+
+    def print(self):
+        pass
 
 
 if __name__ == '__main__':
     parser = init_parser()
     args = parser.parse_args()
     gin.parse_config(args.gin)
-    global save_path
-    global writer
 
-    # random seed
-    if 'WORLD_SIZE' in os.environ:
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
-        args.dist_url = "env://"
-        dist.init_process_group(
-            backend="gloo",
-            init_method=args.dist_url,
-            world_size=args.world_size,
-            rank=args.rank,
-        )
+        use_cuda = torch.cuda.is_available() and not args.no_cuda
+        if use_cuda:
+            torch.cuda.set_device(args.gpu)
+        dist.init_process_group(backend="nccl" if use_cuda else "gloo", init_method="env://",
+                                world_size=args.world_size, rank=args.rank)
         args.distributed = True
         dist.barrier()
         import builtins as __builtin__
@@ -668,22 +685,24 @@ if __name__ == '__main__':
 
         def print(*args, **kwargs):
             force = kwargs.pop('force', False)
-            if ismaster:
+            if ismaster or force:
                 builtin_print(*args, **kwargs)
 
         __builtin__.print = print
     else:
-        args.gpu = 0  # mark 10
         args.distributed = False
+        args.rank = 0
+        args.world_size = 1
 
+    use_cuda = torch.cuda.is_available() and not args.no_cuda
+    args.device = torch.device('cuda', args.gpu) if use_cuda else torch.device('cpu')
+
+    # random seed
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)  # if you are using multi-GPU.
+    torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)  # Numpy module.
     random.seed(args.seed)  # Python random module.
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
 
     model_name = args.arch
 
@@ -698,31 +717,35 @@ if __name__ == '__main__':
         model_name += "-LSA"
 
     model_name += f"-{args.tag}-{args.dataset}-LR[{args.lr}]-Seed{args.seed}"
-    save_path = os.path.join(os.getcwd(), 'save_finetuned', model_name)
-    if save_path:
-        os.makedirs(save_path, exist_ok=True)
+    save_path = os.path.join(args.output_dir, args.exp_name or model_name)
+    os.makedirs(save_path, exist_ok=True)
 
-    if (not args.distributed) or args.rank == 0:
-        wandb.init(job_type='finetune', dir=save_path,
-                   config=args.__dict__, tensorboard=True)
+    wandb = None
+    if args.wandb and is_main():
+        import wandb
+        wandb.init(job_type='finetune', dir=save_path, name=args.exp_name or model_name,
+                   config=args.__dict__)
 
     # logger
-
     log_dir = os.path.join(save_path, 'history.csv')
     logger = log.getLogger(__name__)
     formatter = log.Formatter('%(message)s')
     streamHandler = log.StreamHandler()
-    fileHandler = log.FileHandler(log_dir, 'a')
     streamHandler.setFormatter(formatter)
-    fileHandler.setFormatter(formatter)
     logger.addHandler(streamHandler)
-    logger.addHandler(fileHandler)
-    logger.setLevel(level=log.DEBUG)
+    if is_main():
+        fileHandler = log.FileHandler(log_dir, 'a')
+        fileHandler.setFormatter(formatter)
+        logger.addHandler(fileHandler)
+        logger.setLevel(level=log.DEBUG)
+    else:
+        logger.setLevel(level=log.WARNING)
 
-    global logger_dict
-    global keys
-
-    logger_dict = Logger_dict(logger, save_path)
     keys = ['T Loss', 'T Top-1', 'V Loss', 'V Top-1']
+    logger_dict = Logger_dict(logger, save_path) if is_main() else _NullLoggerDict()
 
     main(args)
+
+    if args.distributed:
+        dist.barrier()
+        dist.destroy_process_group()

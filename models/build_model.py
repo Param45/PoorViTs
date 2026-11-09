@@ -1,7 +1,4 @@
-import gin.config
 from .vit import VisionTransformer
-from .swin import SwinTransformer
-from .cait import cait_models
 from functools import partial
 from torch import nn
 
@@ -40,7 +37,8 @@ def create_model(img_size, n_classes, args):
         #     norm_layer=partial(nn.LayerNorm, eps=1e-6),
         # )
 
-    elif args.arch == 'cait':       
+    elif args.arch == 'cait':
+        from .cait import cait_models  # needs timm
         patch_size = 4 if img_size == 32 else 8
         model = cait_models(
         img_size= img_size,patch_size=patch_size, embed_dim=192, depth=24, num_heads=4, mlp_ratio=args.vit_mlp_ratio,
@@ -49,7 +47,7 @@ def create_model(img_size, n_classes, args):
     
         
     elif args.arch =='swin':
-        
+        from .swin import SwinTransformer  # needs timm
         mlp_ratio = args.vit_mlp_ratio
         window_size = 4
         patch_size = 2 if img_size==32 else 4
@@ -67,7 +65,7 @@ def create_model(img_size, n_classes, args):
                 return self.model.repeat(x.shape[0],1)
         model = NoneModel()
     else:
-        NotImplementedError("Model architecture not implemented . . .")
+        raise NotImplementedError("Model architecture not implemented . . .")
 
          
     return model
